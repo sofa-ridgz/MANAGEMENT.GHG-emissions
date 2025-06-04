@@ -1,0 +1,313 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from mpl_toolkits.mplot3d import Axes3D
+
+# Load the Excel file
+file_path = '/content/drive/MyDrive/MANAGEMENT /filtered_data.xlsx'
+df = pd.read_excel(file_path)
+
+# Define the specific building numbers to analyze
+building_numbers = [75, 161, 659, 2088]
+
+# Assuming there's a column that contains these building numbers
+# If you don't have a column with building numbers, we need to know which column identifies buildings
+# For now, let's assume the building numbers are in the index or a specific column
+
+# Check if building numbers are in the index
+if all(num in df.index for num in building_numbers):
+    selected_buildings = df.loc[building_numbers].copy()
+else:
+    # Try to find a column that might contain building numbers
+    building_id_columns = ['Building ID', 'ID', 'Property Id', 'Building', 'Property ID']
+    building_col = None
+
+    for col in building_id_columns:
+        if col in df.columns:
+            building_col = col
+            break
+
+    if building_col:
+        # Filter rows where the building column contains the specified numbers
+        selected_buildings = df[df[building_col].isin(building_numbers)].copy()
+    else:
+        # As a last resort, search all columns for the building numbers
+        mask = pd.Series(False, index=df.index)
+        for col in df.columns:
+            if df[col].dtype in [np.int64, np.float64, 'int64', 'float64'] or df[col].dtype.kind in 'ifu':
+                mask = mask | df[col].isin(building_numbers)
+
+        selected_buildings = df[mask].copy()
+
+        if len(selected_buildings) != len(building_numbers):
+            print(f"Warning: Found {len(selected_buildings)} buildings instead of {len(building_numbers)}.")
+            print("Please verify the selected buildings are correct by checking the Building Label values below.")
+
+
+# Function to handle NaN values (treating them as 0)
+def safe_value(value):
+    return 0 if pd.isna(value) else value
+
+# Make sure to convert columns to numeric
+total_electricity_col = 'Electricity Use - Grid Purchase and Generated from Onsite Renewable Systems (kBtu)'
+renewable_electricity_col = 'Electricity Use – Generated from Onsite Renewable Systems and Used Onsite (kBtu)'
+primary_area_col = 'Largest Property Use Type - Gross Floor Area (ft²)'
+total_seconds_area_col = '2nd Largest Property Use - Gross Floor Area (ft²)'
+id_col='Property Id'
+gas_use_col='Natural Gas Use (kBtu)'
+
+# Convert columns to numeric, handling any conversion errors
+for col in [total_electricity_col, renewable_electricity_col, primary_area_col, total_seconds_area_col, id_col, gas_use_col, 'Total GHG Emissions (Metric Tons CO2e)']:
+    selected_buildings[col] = pd.to_numeric(selected_buildings[col], errors='coerce')
+
+# Fill NaN values with 0
+selected_buildings[renewable_electricity_col] = selected_buildings[renewable_electricity_col].fillna(0)
+selected_buildings[total_electricity_col] = selected_buildings[total_electricity_col].fillna(0)
+selected_buildings[primary_area_col] = selected_buildings[primary_area_col].fillna(0)
+selected_buildings[total_seconds_area_col] = selected_buildings[total_seconds_area_col].fillna(0)
+
+# Calculate renewable energy percentage for each building
+selected_buildings['Renewable Energy %'] = np.where(
+    selected_buildings[total_electricity_col] > 0,
+    (selected_buildings[renewable_electricity_col] / (selected_buildings[total_electricity_col]+selected_buildings[gas_use_col])) * 100,
+    0
+)
+
+# Print initial info about the buildings we found
+print("Selected buildings info:")
+print("-" * 50)
+for idx, row in selected_buildings.iterrows():
+    print(f"Row index: {idx}")
+    # Print the first few columns to help identify the building
+    for col in selected_buildings.columns[:5]:
+        print(f"  {col}: {row[col]}")
+    print("-" * 30)
+
+# Calculate min and max 10-year costs for each energy system
+# Create new columns for min and max costs
+cost_columns = [
+    'Gas System Cost Min (10yr)', 'Gas System Cost Max (10yr)',
+    'Grid Electricity Cost Min (10yr)', 'Grid Electricity Cost Max (10yr)',
+    'Renewable System Cost Min (10yr)', 'Renewable System Cost Max (10yr)',
+    'Total Energy Cost Min (10yr)', 'Total Energy Cost Max (10yr)', 'Total Area'
+]
+
+for col in cost_columns:
+    selected_buildings[col] = 0.0
+
+for idx, row in selected_buildings.iterrows():
+
+    building_rows = safe_value(row[id_col])
+
+    primary_area = safe_value(row[primary_area_col])
+
+    second_area = safe_value(row[total_seconds_area_col])
+
+    total_area = primary_area + second_area
+
+    # Natural Gas Costs
+    gas_usage = safe_value(row['Natural Gas Use (kBtu)'])
+    gas_rate_min, gas_rate_max = 0.0198, 0.0287
+    gas_installation_min, gas_installation_max = 3200, 9000
+    gas_maintenance_min, gas_maintenance_max = 150 * 10, 500 * 10  # 10 years of maintenance
+
+    gas_min_cost = ((gas_usage * gas_rate_min * 10) + gas_installation_min + gas_maintenance_min)/total_area
+    gas_max_cost = ((gas_usage * gas_rate_max * 10) + gas_installation_max + gas_maintenance_max)/total_area
+
+    # Grid Electricity Costs
+    grid_electricity = safe_value(row['Electricity Use - Grid Purchase (kBtu)'])
+    electricity_rate_min, electricity_rate_max = 0.0703, 0.0821
+
+    grid_min_cost = (grid_electricity * electricity_rate_min * 10)/total_area  # 10 years
+    grid_max_cost = (grid_electricity * electricity_rate_max * 10)/total_area  # 10 years
+
+    # Renewable System Costs
+    renewable_electricity = safe_value(row[renewable_electricity_col])
+    panel_output_min, panel_output_max = 1120, 1682  # Energy per panel
+
+    panels_needed_min = renewable_electricity / (panel_output_max) if panel_output_max > 0 else 0
+    panels_needed_max = renewable_electricity / (panel_output_min) if panel_output_min > 0 else 0
+
+    panel_cost_min, panel_cost_max = 750, 1575  # Cost per panel
+    renewable_maintenance_min, renewable_maintenance_max = 150 * 10, 300 * 10  # 10 years of maintenance
+
+    renewable_min_cost = ((panels_needed_min * panel_cost_min) + renewable_maintenance_min)/total_area
+    renewable_max_cost = ((panels_needed_max * panel_cost_max) + renewable_maintenance_max)/total_area
+
+    # Total Energy Costs oer area (10 years)
+    total_min_cost = (gas_min_cost + grid_min_cost + renewable_min_cost)
+    total_max_cost = (gas_max_cost + grid_max_cost + renewable_max_cost)
+
+    # Update the DataFrame
+    selected_buildings.at[idx, 'Gas System Cost Min (10yr)'] = gas_min_cost
+    selected_buildings.at[idx, 'Gas System Cost Max (10yr)'] = gas_max_cost
+    selected_buildings.at[idx, 'Grid Electricity Cost Min (10yr)'] = grid_min_cost
+    selected_buildings.at[idx, 'Grid Electricity Cost Max (10yr)'] = grid_max_cost
+    selected_buildings.at[idx, 'Renewable System Cost Min (10yr)'] = renewable_min_cost
+    selected_buildings.at[idx, 'Renewable System Cost Max (10yr)'] = renewable_max_cost
+    selected_buildings.at[idx, 'Total Energy Cost Min (10yr)'] = total_min_cost
+    selected_buildings.at[idx, 'Total Energy Cost Max (10yr)'] = total_max_cost
+    selected_buildings.at[idx, 'Total Area'] = total_area
+
+# Calculate the average cost for plotting
+selected_buildings['Gas System Cost Avg (10yr)'] = (selected_buildings['Gas System Cost Min (10yr)'] + selected_buildings['Gas System Cost Max (10yr)']) / 2
+selected_buildings['Grid Electricity Cost Avg (10yr)'] = (selected_buildings['Grid Electricity Cost Min (10yr)'] + selected_buildings['Grid Electricity Cost Max (10yr)']) / 2
+selected_buildings['Renewable System Cost Avg (10yr)'] = (selected_buildings['Renewable System Cost Min (10yr)'] + selected_buildings['Renewable System Cost Max (10yr)']) / 2
+selected_buildings['Total Energy Cost Avg (10yr)'] = (selected_buildings['Total Energy Cost Min (10yr)'] + selected_buildings['Total Energy Cost Max (10yr)']) / 2
+
+# Get GHG emissions (handling potential NaN values)
+selected_buildings['Total GHG Emissions (Metric Tons CO2e)'] = selected_buildings['Total GHG Emissions (Metric Tons CO2e)'].fillna(0)/(selected_buildings['Total Area'])
+
+# Create descriptive row labels
+selected_buildings['Building Label'] = [f"Building {i+1} (ID:{selected_buildings.loc[idx, id_col]})"
+                                       for i, idx in enumerate(selected_buildings.index)]
+
+# Display the results
+print("\nAnalysis of Selected Buildings:")
+print("-" * 100)
+display(selected_buildings[['Building Label', 'Renewable Energy %',
+                           'Gas System Cost Min (10yr)', 'Gas System Cost Max (10yr)',
+                           'Grid Electricity Cost Min (10yr)', 'Grid Electricity Cost Max (10yr)',
+                           'Renewable System Cost Min (10yr)', 'Renewable System Cost Max (10yr)',
+                           'Total Energy Cost Min (10yr)', 'Total Energy Cost Max (10yr)',
+                           'Total GHG Emissions (Metric Tons CO2e)']])
+
+# Create visualizations
+plt.figure(figsize=(14, 10))
+
+# 1. Bar chart comparing renewable % for each building
+plt.subplot(2, 2, 1)
+sns.barplot(x='Building Label', y='Renewable Energy %', data=selected_buildings)
+plt.title('Renewable Energy Percentage by Building')
+plt.xticks(rotation=45, ha='right')
+plt.tight_layout()
+
+# 2. Bar chart with error bars for total energy costs
+plt.subplot(2, 2, 2)
+buildings = selected_buildings['Building Label']
+y_pos = np.arange(len(buildings))
+avg_costs = selected_buildings['Total Energy Cost Avg (10yr)']
+error = [(avg_costs - selected_buildings['Total Energy Cost Min (10yr)']),
+         (selected_buildings['Total Energy Cost Max (10yr)'] - avg_costs)]
+
+plt.bar(y_pos, avg_costs, yerr=error, align='center', alpha=0.7, ecolor='black', capsize=10)
+plt.xticks(y_pos, buildings, rotation=45, ha='right')
+plt.ylabel('Total 10-Year Energy Cost ($)')
+plt.title('Total Energy Costs with Min-Max Range')
+plt.tight_layout()
+
+# 3. Stacked bar chart of average energy costs with error bars
+plt.subplot(2, 2, 3)
+width = 0.8
+x = np.arange(len(buildings))
+
+# Gas Costs
+gas_costs = selected_buildings['Gas System Cost Avg (10yr)']
+gas_errors = [(gas_costs - selected_buildings['Gas System Cost Min (10yr)']),
+              (selected_buildings['Gas System Cost Max (10yr)'] - gas_costs)]
+plt.bar(x, gas_costs, width, color='#1f77b4', label='Gas System')
+plt.errorbar(x, gas_costs, yerr=gas_errors, fmt='none', ecolor='black', capsize=5)
+
+# Grid Electricity Costs
+grid_costs = selected_buildings['Grid Electricity Cost Avg (10yr)']
+grid_errors = [(grid_costs - selected_buildings['Grid Electricity Cost Min (10yr)']),
+               (selected_buildings['Grid Electricity Cost Max (10yr)'] - grid_costs)]
+bottom_grid = gas_costs
+plt.bar(x, grid_costs, width, bottom=bottom_grid, color='#ff7f0e', label='Grid Electricity')
+plt.errorbar(x, gas_costs + grid_costs, yerr=grid_errors, fmt='none', ecolor='black', capsize=5)
+
+# Renewable System Costs
+renewable_costs = selected_buildings['Renewable System Cost Avg (10yr)']
+renewable_errors = [(renewable_costs - selected_buildings['Renewable System Cost Min (10yr)']),
+                    (selected_buildings['Renewable System Cost Max (10yr)'] - renewable_costs)]
+bottom_renewable = gas_costs + grid_costs
+plt.bar(x, renewable_costs, width, bottom=bottom_renewable, color='#2ca02c', label='Renewable System')
+plt.errorbar(x, gas_costs + grid_costs + renewable_costs, yerr=renewable_errors, fmt='none', ecolor='black', capsize=5)
+
+plt.xticks(x, buildings, rotation=45, ha='right')
+plt.ylabel('Cost ($)')
+plt.title('Energy Cost Breakdown by Building with Error Ranges')
+plt.legend()
+plt.tight_layout()
+
+# 4. Scatter plot: Renewable % vs Total Cost with error bars
+plt.subplot(2, 2, 4)
+for i, row in selected_buildings.iterrows():
+    x = row['Renewable Energy %']
+    y = row['Total Energy Cost Avg (10yr)']
+    yerr_minus = y - row['Total Energy Cost Min (10yr)']
+    yerr_plus = row['Total Energy Cost Max (10yr)'] - y
+    size = row['Total GHG Emissions (Metric Tons CO2e)'] * 5 + 100  # Adjust size for visibility
+
+    plt.errorbar(x, y, yerr=[[yerr_minus], [yerr_plus]], fmt='o', capsize=5, markersize=size/50)
+    plt.annotate(row['Building Label'].split(' ')[1], (x, y),
+                 xytext=(5, 5), textcoords='offset points')
+
+plt.title('Renewable % vs Total Cost (Size = GHG Emissions)')
+plt.xlabel('Renewable Energy %')
+plt.ylabel('Total Energy Cost (10yr)')
+plt.tight_layout()
+
+plt.show()
+
+# Create a comprehensive bubble chart with error bars
+plt.figure(figsize=(14, 10))
+for i, row in selected_buildings.iterrows():
+    x = row['Renewable Energy %']
+    y = row['Total Energy Cost Avg (10yr)']
+    yerr_minus = y - row['Total Energy Cost Min (10yr)']
+    yerr_plus = row['Total Energy Cost Max (10yr)'] - y
+    size = row['Total GHG Emissions (Metric Tons CO2e)'] * 500000 +200  # Scale emissions for better visibility
+
+    plt.scatter(x, y, s=size, alpha=0.7)
+    plt.errorbar(x, y, yerr=[[yerr_minus], [yerr_plus]], fmt='none', ecolor='black', capsize=10)
+    plt.annotate(row['Building Label'], (x, y),
+                 xytext=(0, 10), textcoords='offset points',
+                 ha='center', fontsize=12, fontweight='bold')
+
+plt.title('Relationship Between Renewable Energy Percentage, Energy Costs, and GHG Emissions', fontsize=14)
+plt.xlabel('Renewable Energy Percentage', fontsize=12)
+plt.ylabel('Total 10-Year Energy Cost ($)', fontsize=12)
+plt.grid(True, linestyle='--', alpha=0.7)
+
+# Add a legend for bubble size
+sizes = [100, 500, 1000]
+labels = ["Low", "Medium", "High"]
+for size, label in zip(sizes, labels):
+    plt.scatter([], [], s=size, label=f'{label} GHG Emissions')
+plt.legend(title='GHG Emissions Level', bbox_to_anchor=(1.05, 1), loc='upper left')
+
+plt.tight_layout()
+plt.show()
+
+# 3D visualization with min/max ranges shown as vertical lines
+fig = plt.figure(figsize=(14, 10))
+ax = fig.add_subplot(111, projection='3d')
+
+for i, row in selected_buildings.iterrows():
+    x = row['Renewable Energy %']
+    y_min = row['Total Energy Cost Min (10yr)']
+    y_avg = row['Total Energy Cost Avg (10yr)']
+    y_max = row['Total Energy Cost Max (10yr)']
+    z = row['Total GHG Emissions (Metric Tons CO2e)']
+
+    # Plot the average point
+    ax.scatter(x, y_avg, z, s=100)
+
+    # Plot vertical line showing the cost range
+    ax.plot([x, x], [y_min, y_max], [z, z], color='black', linewidth=2)
+
+    # Add text label
+    ax.text(x, y_avg, z, row['Building Label'].split(' ')[1], fontsize=10)
+
+ax.set_xlabel('Renewable Energy %')
+ax.set_ylabel('Total Energy Cost (10yr)')
+ax.set_zlabel('GHG Emissions (Metric Tons CO2e)')
+ax.set_title('3D Relationship with Cost Ranges')
+
+plt.tight_layout()
+plt.show()
