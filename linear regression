@@ -1,0 +1,483 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+
+# Define input features globally
+input_features = [
+    # Energy Use Features
+    'Site EUI (kBtu/ft²)', 'Site Energy Use (kBtu)',
+    'Source Energy Use (kBtu)',
+    'Weather Normalized Site Electricity Intensity (kWh/ft²)',
+    'Weather Normalized Site Natural Gas Intensity (therms/ft²)',
+
+    # Specific Energy Source Features
+    'Fuel Oil #1 Use (kBtu)', 'Fuel Oil #2 Use (kBtu)',
+    'Fuel Oil #4 Use (kBtu)', 'Fuel Oil #5 & 6 Use (kBtu)',
+    'Diesel #2 Use (kBtu)',
+    'District Steam Use (kBtu)', 'District Hot Water Use (kBtu)',
+    'District Chilled Water Use (kBtu)',
+    'Natural Gas Use (kBtu)',
+    'Electricity Use - Grid Purchase (kBtu)',
+
+    # Renewable Energy Features
+    'Electricity Use – Generated from Onsite Renewable Systems and Used Onsite (kBtu)',
+    'Green Power - Onsite (kWh)', 'Green Power - Offsite (kWh)',
+
+    # Building Characteristics
+    'Largest Property Use Type - Gross Floor Area (ft²)',
+    'Year Built', 'Occupancy'
+]
+
+# Target variables
+target_variables = [
+    'Total GHG Emissions (Metric Tons CO2e)',
+    'Direct GHG Emissions (Metric Tons CO2e)',
+    'Indirect GHG Emissions (Metric Tons CO2e)'
+]
+
+def add_renewable_category(df):
+    """
+    Add renewable category to the dataset based on the percentage of onsite renewable electricity
+
+    Parameters:
+    df (pandas.DataFrame): Input dataframe with energy data
+
+    Returns:
+    pandas.DataFrame: DataFrame with added renewable category column
+    """
+    # Create a copy of the dataframe
+    df_with_category = df.copy()
+
+    # Replace 'Not Available' with NaN
+    df_with_category = df_with_category.replace('Not Available', np.nan)
+
+    # Convert relevant columns to numeric
+    total_electricity_col = 'Electricity Use - Grid Purchase and Generated from Onsite Renewable Systems (kBtu)'
+    renewable_electricity_col = 'Electricity Use – Generated from Onsite Renewable Systems and Used Onsite (kBtu)'
+
+    df_with_category[total_electricity_col] = pd.to_numeric(df_with_category[total_electricity_col], errors='coerce')
+    df_with_category[renewable_electricity_col] = pd.to_numeric(df_with_category[renewable_electricity_col], errors='coerce')
+
+    # Fill NaN values with 0 for renewable electricity (as specified in the requirements)
+    df_with_category[renewable_electricity_col] = df_with_category[renewable_electricity_col].fillna(0)
+
+    # Calculate percentage of renewable electricity
+    # Avoid division by zero by setting percentage to 0 when total electricity is 0
+    df_with_category['renewable_percentage'] = np.where(
+        df_with_category[total_electricity_col] > 0,
+        (df_with_category[renewable_electricity_col] / df_with_category[total_electricity_col]) * 100,
+        0
+    )
+
+    # Create renewable category based on percentage
+    conditions = [
+        (df_with_category['renewable_percentage'] == 0),
+        (df_with_category['renewable_percentage'] > 0) & (df_with_category['renewable_percentage'] < 50),
+        (df_with_category['renewable_percentage'] >= 50) & (df_with_category['renewable_percentage'] < 100),
+        (df_with_category['renewable_percentage'] == 100)
+    ]
+
+    categories = ['0% renewables', 'Below 50% renewables', 'Above 50% renewables', '100% renewables']
+
+    df_with_category['renewable_category'] = np.select(conditions, categories, default='Unknown')
+
+    return df_with_category
+
+def prepare_ml_model(df):
+    """
+    Prepare data for machine learning model, handling missing values as zeros
+
+    Parameters:
+    df (pandas.DataFrame): Input dataframe with energy and emissions data
+
+    Returns:
+    tuple: Prepared features, target variables, and trained model
+    """
+    # First, add renewable categories to the dataframe
+    df_processed = add_renewable_category(df)
+
+    # Replace 'Not Available' with NaN for all columns
+    df_processed = df_processed.replace('Not Available', np.nan)
+
+    # Convert all input features and target variables to numeric
+    all_columns = input_features + target_variables
+    for col in all_columns:
+        df_processed[col] = pd.to_numeric(df_processed[col], errors='coerce')
+
+    # Print initial missing values
+    print("Missing values before preprocessing:")
+    print(df_processed[all_columns].isnull().sum())
+
+    # Print initial buildings by renewable category
+    initial_category_counts = df_processed['renewable_category'].value_counts()
+    print("\nBuildings by renewable category before preprocessing:")
+    print(initial_category_counts)
+    print(f"Percentage: \n{(initial_category_counts / len(df_processed) * 100).round(2)}%")
+
+    # Replace NaN with 0 for input features
+    for feature in input_features:
+        df_processed[feature] = df_processed[feature].fillna(0)
+
+    # Remove rows with missing target values
+    df_cleaned = df_processed.dropna(subset=target_variables)
+
+    # Check missing values after preprocessing
+    print("\nMissing values after preprocessing:")
+    print(df_cleaned[all_columns].isnull().sum())
+
+    # Print final buildings by renewable category after preprocessing
+    final_category_counts = df_cleaned['renewable_category'].value_counts()
+    print("\nBuildings by renewable category after preprocessing:")
+    print(final_category_counts)
+    print(f"Percentage: \n{(final_category_counts / len(df_cleaned) * 100).round(2)}%")
+    print(f"\nBuildings retained after preprocessing: {len(df_cleaned)} out of {len(df_processed)} ({len(df_cleaned)/len(df_processed)*100:.2f}%)")
+
+    # Prepare features and targets
+    X = df_cleaned[input_features]
+
+    # Dictionary to store models for each target
+    target_models = {}
+
+    # Create a model for each target variable
+    for target in target_variables:
+        # Prepare target variable
+        y = df_cleaned[target]
+
+        # Split the data
+        X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
+            X, y, df_cleaned.index, test_size=0.2, random_state=42
+        )
+
+        # Get corresponding categories for test data
+        test_categories = df_cleaned.loc[idx_test, 'renewable_category']
+
+        # Scale the features
+        scaler_X = StandardScaler()
+        X_train_scaled = scaler_X.fit_transform(X_train)
+        X_test_scaled = scaler_X.transform(X_test)
+
+        # Scale the target variable
+        scaler_y = StandardScaler()
+        y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1)).ravel()
+
+        # Create and train the model
+        model = LinearRegression()
+        model.fit(X_train_scaled, y_train_scaled)
+
+        # Make predictions
+        y_pred_scaled = model.predict(X_test_scaled)
+        y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
+
+        # Evaluate the model
+        mse = mean_squared_error(y_test, y_pred)
+        r2 = r2_score(y_test, y_pred)
+
+        print(f"\nResults for {target}:")
+        print(f"Mean Squared Error: {mse}")
+        print(f"R-squared Score: {r2}")
+
+        # Create DataFrame with predictions, actual values and categories
+        results_df = pd.DataFrame({
+            'actual': y_test.values,
+            'predicted': y_pred,
+            'category': test_categories.values
+        })
+
+        # Calculate average emissions by renewable category
+        category_averages = results_df.groupby('category')['actual'].mean().reset_index()
+
+        print("\nAverage emissions by renewable category:")
+        print(category_averages)
+
+        # Visualize predictions vs actual with colors by category
+        plt.figure(figsize=(12, 8))
+
+        # Define colors for each category
+        category_colors = {
+            '0% renewables': 'red',
+            'Below 50% renewables': 'orange',
+            'Above 50% renewables': 'blue',
+            '100% renewables': 'green'
+        }
+
+        # Plot each category with different color
+        for category, color in category_colors.items():
+            category_data = results_df[results_df['category'] == category]
+            if not category_data.empty:  # Only plot if there's data for this category
+                plt.scatter(
+                    category_data['actual'],
+                    category_data['predicted'],
+                    alpha=0.7,
+                    color=color,
+                    label=f"{category} (n={len(category_data)})"
+                )
+
+        # Add reference line
+        plt.plot([y_test.min(), y_test.max()], [y_test.min(), y_test.max()], 'k--', lw=2)
+
+        plt.title(f'Predicted vs Actual {target} by Renewable Category')
+        plt.xlabel('Actual Values')
+        plt.ylabel('Predicted Values')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.show()
+
+        # Also create a bar chart for average emissions by category
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(category_averages['category'], category_averages['actual'])
+
+        # Color the bars according to the category
+        for i, bar in enumerate(bars):
+            category = category_averages.iloc[i]['category']
+            if category in category_colors:
+                bar.set_color(category_colors[category])
+
+        plt.title(f'Average {target} by Renewable Category')
+        plt.xlabel('Renewable Category')
+        plt.ylabel(f'{target}')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+
+        # Store model and scaler
+        target_models[target] = {
+            'model': model,
+            'scaler_X': scaler_X,
+            'scaler_y': scaler_y
+        }
+
+    return target_models, df_cleaned
+
+def predict_emissions(target_models, new_data):
+    """
+    Predict emissions for new data using trained models
+
+    Parameters:
+    target_models (dict): Dictionary of trained models for each target
+    new_data (pandas.DataFrame): New data to predict emissions for
+
+    Returns:
+    dict: Predicted emissions for each target variable
+    """
+    # Add renewable categories to the new data
+    new_data_processed = add_renewable_category(new_data)
+
+    # Replace 'Not Available' with NaN
+    new_data_processed = new_data_processed.replace('Not Available', np.nan)
+
+    # Convert to numeric
+    for col in new_data_processed.columns:
+        if col in input_features:
+            new_data_processed[col] = pd.to_numeric(new_data_processed[col], errors='coerce')
+
+    # Replace NaN with 0 for input features
+    for col in input_features:
+        if col in new_data_processed.columns:
+            new_data_processed[col] = new_data_processed[col].fillna(0)
+
+    predictions = {}
+
+    for target, model_info in target_models.items():
+        # Extract just the input features
+        X_new = new_data_processed[input_features]
+
+        # Scale the input features
+        X_new_scaled = model_info['scaler_X'].transform(X_new)
+
+        # Predict and inverse transform
+        y_pred_scaled = model_info['model'].predict(X_new_scaled)
+        y_pred = model_info['scaler_y'].inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
+
+        # Store predictions with categories
+        predictions[target] = pd.DataFrame({
+            'predicted': y_pred,
+            'category': new_data_processed['renewable_category']
+        })
+
+    return predictions
+
+def analyze_data_filtering(df):
+    """
+    Analyze how many rows are dropped due to missing target variables
+
+    Parameters:
+    df (pandas.DataFrame): Input dataframe with energy and emissions data
+
+    Returns:
+    dict: Information about data filtering
+    """
+
+    # Total number of buildings
+    total_buildings = len(df)
+
+    # Replace 'Not Available' with NaN for all columns
+    df_processed = df.replace('Not Available', np.nan)
+
+    # Convert all target variables to numeric
+    for col in target_variables:
+        df_processed[col] = pd.to_numeric(df_processed[col], errors='coerce')
+
+    # Count missing values in each target variable
+    missing_values_count = df_processed[target_variables].isnull().sum()
+
+    # Buildings with complete target data
+    complete_target_rows = df_processed.dropna(subset=target_variables)
+
+    # Print detailed analysis
+    print("Total number of buildings:", total_buildings)
+    print("\nMissing values in target variables:")
+    print(missing_values_count)
+
+    print(f"\nNumber of buildings dropped due to missing target data: {total_buildings - len(complete_target_rows)}")
+    print(f"Percentage of buildings dropped: {((total_buildings - len(complete_target_rows)) / total_buildings * 100):.2f}%")
+
+    # Detailed breakdown of missing values
+    print("\nDetailed Missing Value Analysis:")
+    missing_analysis = df_processed[target_variables].isnull()
+    for col in target_variables:
+        print(f"{col}:")
+        print(missing_analysis[col].value_counts(normalize=True) * 100)
+        print()
+
+    return {
+        'total_buildings': total_buildings,
+        'buildings_dropped': total_buildings - len(complete_target_rows),
+        'missing_values': missing_values_count
+    }
+
+def analyze_renewable_impact(df_cleaned):
+    """
+    Analyze the impact of renewable energy usage on emissions
+
+    Parameters:
+    df_cleaned (pandas.DataFrame): Processed dataframe with categories and emissions data
+
+    Returns:
+    None (prints analysis and displays plots)
+    """
+    # Convert target variables to numeric if not already
+    for target in target_variables:
+        df_cleaned[target] = pd.to_numeric(df_cleaned[target], errors='coerce')
+
+    # Analyze each target variable
+    for target in target_variables:
+        # Calculate statistics by renewable category
+        category_stats = df_cleaned.groupby('renewable_category')[target].agg(['mean', 'median', 'std', 'count']).reset_index()
+
+        print(f"\nStatistics for {target} by renewable category:")
+        print(category_stats)
+
+        # Create visualizations
+        plt.figure(figsize=(12, 6))
+
+        # Define colors for each category
+        category_colors = {
+            '0% renewables': 'red',
+            'Below 50% renewables': 'orange',
+            'Above 50% renewables': 'blue',
+            '100% renewables': 'green'
+        }
+
+        # Box plot by category
+        boxplot = df_cleaned.boxplot(column=target, by='renewable_category', figsize=(12, 6),
+                                    patch_artist=True, return_type='dict')
+
+        # Change boxplot colors
+        for i, box in enumerate(boxplot[target]['boxes']):
+            category = category_stats.iloc[i]['renewable_category']
+            if category in category_colors:
+                box.set_facecolor(category_colors[category])
+
+        plt.title(f'Distribution of {target} by Renewable Category')
+        plt.suptitle('')  # Remove default suptitle
+        plt.xlabel('Renewable Category')
+        plt.ylabel(target)
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.show()
+
+        # Calculate percentage reduction compared to 0% renewables baseline
+        if '0% renewables' in category_stats['renewable_category'].values:
+            baseline = category_stats.loc[category_stats['renewable_category'] == '0% renewables', 'mean'].values[0]
+
+            category_stats['emission_reduction_pct'] = ((baseline - category_stats['mean']) / baseline) * 100
+
+            print("\nPercentage reduction in emissions compared to 0% renewables:")
+            print(category_stats[['renewable_category', 'mean', 'emission_reduction_pct']])
+
+            # Bar chart for percentage reduction
+            reduction_data = category_stats[category_stats['renewable_category'] != '0% renewables']
+
+            if not reduction_data.empty:
+                plt.figure(figsize=(10, 6))
+                bars = plt.bar(reduction_data['renewable_category'], reduction_data['emission_reduction_pct'])
+
+                # Color the bars
+                for i, bar in enumerate(bars):
+                    category = reduction_data.iloc[i]['renewable_category']
+                    if category in category_colors:
+                        bar.set_color(category_colors[category])
+
+                plt.title(f'Percentage Reduction in {target} Compared to 0% Renewables')
+                plt.xlabel('Renewable Category')
+                plt.ylabel('Percentage Reduction (%)')
+                plt.xticks(rotation=45, ha='right')
+                plt.grid(axis='y', alpha=0.3)
+                plt.tight_layout()
+                plt.show()
+
+# Example usage
+df_filtered = pd.read_excel('/content/drive/MyDrive/MANAGEMENT /filtered_data.xlsx')
+
+# First, analyze the data filtering to understand how many buildings we have
+filtering_results = analyze_data_filtering(df_filtered)
+
+# Add renewable categories to get a breakdown of buildings by category
+df_with_categories = add_renewable_category(df_filtered)
+
+# Count buildings in each renewable category
+category_counts = df_with_categories['renewable_category'].value_counts()
+print("\nBuildings by renewable energy category:")
+print(category_counts)
+print(f"Percentage distribution: \n{(category_counts / len(df_with_categories) * 100).round(2)}%")
+
+# Train models and get processed dataframe with renewable categories
+target_models, df_cleaned = prepare_ml_model(df_filtered)
+
+# Report on how many buildings were used in the final analysis after all preprocessing
+print(f"\nFinal number of buildings used in analysis: {len(df_cleaned)}")
+print(f"Buildings by renewable category in final analysis:")
+final_category_counts = df_cleaned['renewable_category'].value_counts()
+print(final_category_counts)
+print(f"Percentage distribution in final analysis: \n{(final_category_counts / len(df_cleaned) * 100).round(2)}%")
+
+# Additional analysis on the impact of renewable energy
+analyze_renewable_impact(df_cleaned)
+
+# To predict for new data (using first 10 rows as an example):
+new_data = df_filtered.iloc[:10, :][input_features + ['Electricity Use - Grid Purchase and Generated from Onsite Renewable Systems (kBtu)']]
+predictions = predict_emissions(target_models, new_data)
+
+# Print predictions with categories
+print("\n===== PREDICTION RESULTS =====")
+print(f"Number of buildings predicted: {len(new_data)}")
+
+for target, pred_df in predictions.items():
+    print(f"\nPredictions for {target}:")
+
+    # Count of buildings in each category
+    pred_category_counts = pred_df['category'].value_counts()
+    print("Buildings by category in prediction set:")
+    print(pred_category_counts)
+
+    # Average predictions by category
+    category_avg = pred_df.groupby('category')['predicted'].mean().reset_index()
+    print("\nAverage predicted emissions by category:")
+    print(category_avg)
